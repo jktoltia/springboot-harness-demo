@@ -63,12 +63,25 @@ mvn verify -Pfunctional-tests -Dskip.unit.tests=true -Djacoco.skip=true -Dapp.ba
    For SonarCloud, also add `-Dsonar.organization=<org>` to the scan step.
 5. **Import the entities** (*Git Experience → Import from Git*, or paste the YAML) in this order:
    environments → infrastructures → service → pipeline → trigger.
-6. **First run:** deploy QA once and get the LoadBalancer address
-   (`kubectl get svc -n springboot-qa`). Set `qaBaseUrl` to that address in the run inputs and in the trigger.
+6. **Prepare the cluster** (this sample targets Docker Desktop Kubernetes, but any cluster works):
+   ```bash
+   kubectl create namespace springboot-qa
+   kubectl create namespace springboot-prod
+   kubectl create namespace harness-builds
+   ```
+   Install a Harness delegate into the cluster with Helm; `k8s_cluster_connector` uses that delegate.
+7. **Docker Hub repository must be public**, or add an `imagePullSecret`, so the cluster can pull the image.
 
-> The functional-test stage runs on Harness Cloud, so QA has to be reachable from the internet.
-> If QA is private, change that stage's `runtime` to a Kubernetes build infrastructure inside the cluster
-> and point `qaBaseUrl` to `http://springboot-harness-demo.springboot-qa.svc.cluster.local`.
+The build stage runs on Harness Cloud. The functional-test stage runs as pods in the cluster
+(namespace `harness-builds`), so it reaches QA at
+`http://springboot-harness-demo.springboot-qa.svc.cluster.local` (the `qaBaseUrl` default) and
+QA never needs to be exposed publicly.
+
+To open an environment in your browser:
+
+```bash
+kubectl port-forward svc/springboot-harness-demo -n springboot-qa 8081:80   # http://localhost:8081/api/info
+```
 
 ## Seeing the gates work
 

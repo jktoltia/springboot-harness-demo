@@ -35,9 +35,9 @@
       value: springboot-harness-demo
     - name: qaBaseUrl
       type: String
-      description: URL the functional tests call, e.g. http://<qa-load-balancer-ip>
+      description: URL the functional tests call. Default is the in-cluster DNS name of the QA service.
       required: true
-      value: <+input>
+      value: <+input>.default(http://springboot-harness-demo.springboot-qa.svc.cluster.local)
 
   stages:
     # ------------------------------------------------------------------ CI
@@ -189,16 +189,16 @@
         type: CI
         spec:
           cloneCodebase: true
-          caching:
-            enabled: true
-            paths:
-              - /harness/.m2
-          platform:
-            os: Linux
-            arch: Amd64
-          runtime:
-            type: Cloud
-            spec: {}
+          # Runs as pods in the same cluster as QA (via the delegate), so the tests can reach
+          # the QA service by its cluster DNS name - required for a local Docker Desktop cluster.
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: k8s_cluster_connector
+              namespace: harness-builds
+              automountServiceAccountToken: true
+              nodeSelector: {}
+              os: Linux
           execution:
             steps:
               - step:

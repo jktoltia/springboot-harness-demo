@@ -40,4 +40,4 @@
           value: https://sonarqube.mycompany.com
         - name: qaBaseUrl
           type: String
-          value: http://CHANGE-ME-qa-lb-address
+          value: http://springboot-harness-demo.springboot-qa.svc.cluster.local

@@ -5,4 +5,6 @@ image: <+artifacts.primary.image>
 version: <+artifacts.primary.tag>
 environment: <+env.identifier>
 replicas: 2
-serviceType: LoadBalancer
+# ClusterIP: tests reach QA via cluster DNS; use `kubectl port-forward` to open it locally.
+# (On Docker Desktop, two LoadBalancer services would both try to bind localhost:80.)
+serviceType: ClusterIP
