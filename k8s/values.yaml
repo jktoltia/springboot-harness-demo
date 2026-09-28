@@ -1,0 +1,8 @@
+# Harness resolves the <+...> expressions before rendering the Go templates.
+name: springboot-harness-demo
+namespace: <+infra.namespace>
+image: <+artifacts.primary.image>
+version: <+artifacts.primary.tag>
+environment: <+env.identifier>
+replicas: 2
+serviceType: LoadBalancer

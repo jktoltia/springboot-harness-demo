@@ -1,0 +1,36 @@
+service:
+  name: springboot-demo
+  identifier: springboot_demo
+  orgIdentifier: default
+  projectIdentifier: default_project
+  serviceDefinition:
+    type: Kubernetes
+    spec:
+      manifests:
+        - manifest:
+            identifier: k8s_manifests
+            type: K8sManifest
+            spec:
+              store:
+                type: Github
+                spec:
+                  connectorRef: github_connector
+                  repoName: springboot-harness-demo
+                  gitFetchType: Branch
+                  branch: main
+                  paths:
+                    - k8s/templates
+              valuesPaths:
+                - k8s/values.yaml
+              skipResourceVersioning: false
+      artifacts:
+        primary:
+          primaryArtifactRef: app_image
+          sources:
+            - identifier: app_image
+              type: DockerRegistry
+              spec:
+                connectorRef: dockerhub_connector
+                imagePath: <+pipeline.variables.imageRepo>
+                # Build once, deploy many: the same immutable tag built in CI goes to QA and Prod
+                tag: <+pipeline.variables.imageTag>

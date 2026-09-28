@@ -1,0 +1,13 @@
+infrastructureDefinition:
+  name: qa-k8s
+  identifier: qa_k8s
+  orgIdentifier: default
+  projectIdentifier: default_project
+  environmentRef: qa
+  deploymentType: Kubernetes
+  type: KubernetesDirect
+  spec:
+    connectorRef: k8s_cluster_connector
+    namespace: springboot-qa
+    releaseName: release-<+INFRA_KEY_SHORT_ID>
+  allowSimultaneousDeployments: false

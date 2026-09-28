@@ -1,0 +1,43 @@
+﻿trigger:
+  name: main-push
+  identifier: main_push
+  enabled: true
+  orgIdentifier: default
+  projectIdentifier: default_project
+  pipelineIdentifier: springboot_demo_cicd
+  source:
+    type: Webhook
+    spec:
+      type: Github
+      spec:
+        type: Push
+        spec:
+          connectorRef: github_connector
+          repoName: springboot-harness-demo
+          autoAbortPreviousExecutions: false
+          payloadConditions:
+            - key: targetBranch
+              operator: Equals
+              value: main
+          headerConditions: []
+          actions: []
+  inputYaml: |
+    pipeline:
+      identifier: springboot_demo_cicd
+      properties:
+        ci:
+          codebase:
+            build:
+              type: branch
+              spec:
+                branch: <+trigger.branch>
+      variables:
+        - name: imageRepo
+          type: String
+          value: myuser/springboot-harness-demo
+        - name: sonarHostUrl
+          type: String
+          value: https://sonarqube.mycompany.com
+        - name: qaBaseUrl
+          type: String
+          value: http://CHANGE-ME-qa-lb-address

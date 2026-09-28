@@ -1,0 +1,374 @@
+﻿pipeline:
+  name: springboot-demo-cicd
+  identifier: springboot_demo_cicd
+  orgIdentifier: default
+  projectIdentifier: default_project
+  tags:
+    app: springboot-harness-demo
+  description: |
+    Build -> unit tests + coverage gate -> SonarQube quality gate -> image -> deploy QA
+    -> functional tests -> PASSED: promote image, approve, deploy Prod
+                           FAILED: reject build, Prod is never touched
+
+  properties:
+    ci:
+      codebase:
+        connectorRef: github_connector
+        repoName: springboot-harness-demo
+        build: <+input>
+
+  variables:
+    - name: imageRepo
+      type: String
+      description: Docker Hub repository, e.g. myuser/springboot-harness-demo
+      required: true
+      value: <+input>.default(myuser/springboot-harness-demo)
+    - name: imageTag
+      type: String
+      description: Immutable tag built once and deployed to every environment
+      value: <+pipeline.sequenceId>
+    - name: sonarHostUrl
+      type: String
+      value: <+input>.default(https://sonarqube.mycompany.com)
+    - name: sonarProjectKey
+      type: String
+      value: springboot-harness-demo
+    - name: qaBaseUrl
+      type: String
+      description: URL the functional tests call, e.g. http://<qa-load-balancer-ip>
+      required: true
+      value: <+input>
+
+  stages:
+    # ------------------------------------------------------------------ CI
+    - stage:
+        name: Build and Quality Gate
+        identifier: Build_and_Quality_Gate
+        type: CI
+        spec:
+          cloneCodebase: true
+          caching:
+            enabled: true
+            paths:
+              - /harness/.m2
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Build Unit Test and Coverage
+                  identifier: Build_Unit_Test
+                  spec:
+                    connectorRef: account.harnessImage
+                    image: maven:3.9-eclipse-temurin-17
+                    shell: Bash
+                    # Quality gate #1: unit tests must pass and JaCoCo line coverage >= 70% (see pom.xml)
+                    command: mvn -B -Dmaven.repo.local=/harness/.m2 clean verify
+                    reports:
+                      type: JUnit
+                      spec:
+                        paths:
+                          - target/surefire-reports/TEST-*.xml
+
+              - step:
+                  type: Run
+                  name: SonarQube Scan
+                  identifier: Sonar_Scan
+                  spec:
+                    connectorRef: account.harnessImage
+                    image: maven:3.9-eclipse-temurin-17
+                    shell: Bash
+                    envVariables:
+                      SONAR_TOKEN: <+secrets.getValue("sonar_token")>
+                    command: |
+                      mvn -B -Dmaven.repo.local=/harness/.m2 \
+                        org.sonarsource.scanner.maven:sonar-maven-plugin:5.1.0.4751:sonar \
+                        -Dsonar.host.url=<+pipeline.variables.sonarHostUrl> \
+                        -Dsonar.projectKey=<+pipeline.variables.sonarProjectKey> \
+                        -Dsonar.projectVersion=<+pipeline.variables.imageTag> \
+                        -Dsonar.token=$SONAR_TOKEN
+
+              - step:
+                  type: Run
+                  name: SonarQube Quality Gate
+                  identifier: Sonar_Quality_Gate
+                  spec:
+                    connectorRef: account.harnessImage
+                    image: alpine:3.20
+                    shell: Sh
+                    envVariables:
+                      SONAR_TOKEN: <+secrets.getValue("sonar_token")>
+                      SONAR_HOST_URL: <+pipeline.variables.sonarHostUrl>
+                    # Quality gate #2: waits for Sonar to process the analysis, fails the pipeline unless status == OK
+                    command: |
+                      set -e
+                      apk add --no-cache curl jq >/dev/null
+                      CE_TASK_URL=$(grep '^ceTaskUrl=' target/sonar/report-task.txt | cut -d= -f2-)
+
+                      for i in $(seq 1 60); do
+                        TASK=$(curl -sf -u "$SONAR_TOKEN:" "$CE_TASK_URL")
+                        TASK_STATUS=$(echo "$TASK" | jq -r .task.status)
+                        echo "Sonar background task: $TASK_STATUS"
+                        case "$TASK_STATUS" in
+                          SUCCESS) break ;;
+                          FAILED|CANCELED) echo "Sonar analysis $TASK_STATUS"; exit 1 ;;
+                        esac
+                        sleep 5
+                      done
+                      [ "$TASK_STATUS" = "SUCCESS" ] || { echo "Timed out waiting for Sonar"; exit 1; }
+
+                      ANALYSIS_ID=$(echo "$TASK" | jq -r .task.analysisId)
+                      RESULT=$(curl -sf -u "$SONAR_TOKEN:" "$SONAR_HOST_URL/api/qualitygates/project_status?analysisId=$ANALYSIS_ID")
+                      echo "$RESULT" | jq -r '.projectStatus.conditions[] | "  \(.metricKey): \(.actualValue) (\(.comparator) \(.errorThreshold)) -> \(.status)"'
+
+                      QUALITY_GATE_STATUS=$(echo "$RESULT" | jq -r .projectStatus.status)
+                      echo "Quality gate: $QUALITY_GATE_STATUS"
+                      [ "$QUALITY_GATE_STATUS" = "OK" ] || { echo "Quality gate FAILED - stopping pipeline"; exit 1; }
+                    outputVariables:
+                      - name: QUALITY_GATE_STATUS
+
+              - step:
+                  type: BuildAndPushDockerRegistry
+                  name: Build and Push Image
+                  identifier: Build_and_Push
+                  spec:
+                    connectorRef: dockerhub_connector
+                    repo: <+pipeline.variables.imageRepo>
+                    dockerfile: Dockerfile
+                    tags:
+                      - <+pipeline.variables.imageTag>
+
+    # ------------------------------------------------------------------ CD: QA
+    - stage:
+        name: Deploy QA
+        identifier: Deploy_QA
+        type: Deployment
+        spec:
+          deploymentType: Kubernetes
+          service:
+            serviceRef: springboot_demo
+          environment:
+            environmentRef: qa
+            deployToAll: false
+            infrastructureDefinitions:
+              - identifier: qa_k8s
+          execution:
+            steps:
+              - step:
+                  type: K8sRollingDeploy
+                  name: Rolling Deploy QA
+                  identifier: Rolling_Deploy_QA
+                  timeout: 10m
+                  spec:
+                    skipDryRun: false
+                    pruningEnabled: false
+            rollbackSteps:
+              - step:
+                  type: K8sRollingRollback
+                  name: Rollback QA
+                  identifier: Rollback_QA
+                  timeout: 10m
+                  spec:
+                    pruningEnabled: false
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: StageRollback
+
+    # ------------------------------------------------------------------ Functional tests on QA
+    - stage:
+        name: Functional Tests
+        identifier: Functional_Tests
+        type: CI
+        spec:
+          cloneCodebase: true
+          caching:
+            enabled: true
+            paths:
+              - /harness/.m2
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Wait for QA
+                  identifier: Wait_for_QA
+                  spec:
+                    connectorRef: account.harnessImage
+                    image: curlimages/curl:8.10.1
+                    shell: Sh
+                    # Make sure QA is healthy AND is running the build we just deployed
+                    command: |
+                      URL=<+pipeline.variables.qaBaseUrl>
+                      EXPECTED=<+pipeline.variables.imageTag>
+                      for i in $(seq 1 30); do
+                        INFO=$(curl -sf "$URL/api/info" || true)
+                        echo "Attempt $i: $INFO"
+                        echo "$INFO" | grep -q "\"version\":\"$EXPECTED\"" && exit 0
+                        sleep 10
+                      done
+                      echo "QA never reported version $EXPECTED"
+                      exit 1
+
+              - step:
+                  type: Run
+                  name: Run Functional Tests
+                  identifier: Run_Functional_Tests
+                  spec:
+                    connectorRef: account.harnessImage
+                    image: maven:3.9-eclipse-temurin-17
+                    shell: Bash
+                    # Never fails the step itself: the result is published as FT_STATUS
+                    # and the next stages branch on it (promote vs reject).
+                    command: |
+                      set +e
+                      mvn -B -Dmaven.repo.local=/harness/.m2 verify -Pfunctional-tests \
+                        -Dskip.unit.tests=true -Djacoco.skip=true \
+                        -Dapp.baseUrl=<+pipeline.variables.qaBaseUrl>
+                      if [ $? -eq 0 ]; then FT_STATUS=PASSED; else FT_STATUS=FAILED; fi
+                      echo "Functional tests: $FT_STATUS"
+                    outputVariables:
+                      - name: FT_STATUS
+                    reports:
+                      type: JUnit
+                      spec:
+                        paths:
+                          - target/failsafe-reports/TEST-*.xml
+
+              - step:
+                  type: Run
+                  name: Promote Image as QA Verified
+                  identifier: Promote_Image
+                  when:
+                    stageStatus: Success
+                    condition: <+execution.steps.Run_Functional_Tests.output.outputVariables.FT_STATUS> == "PASSED"
+                  spec:
+                    connectorRef: account.harnessImage
+                    image: regclient/regctl:alpine
+                    shell: Sh
+                    envVariables:
+                      DOCKER_USER: <+secrets.getValue("dockerhub_username")>
+                      DOCKER_TOKEN: <+secrets.getValue("dockerhub_token")>
+                    # Registry-side retag (no rebuild): the exact tested image gets promotion tags
+                    command: |
+                      set -e
+                      REPO=docker.io/<+pipeline.variables.imageRepo>
+                      TAG=<+pipeline.variables.imageTag>
+                      regctl registry login docker.io -u "$DOCKER_USER" -p "$DOCKER_TOKEN"
+                      regctl image copy "$REPO:$TAG" "$REPO:qa-verified-$TAG"
+                      regctl image copy "$REPO:$TAG" "$REPO:qa-verified"
+                      echo "Promoted $REPO:$TAG -> qa-verified-$TAG, qa-verified"
+
+    # ------------------------------------------------------------------ FAIL path
+    - stage:
+        name: Reject Build
+        identifier: Reject_Build
+        type: Custom
+        when:
+          pipelineStatus: Success
+          condition: <+pipeline.stages.Functional_Tests.spec.execution.steps.Run_Functional_Tests.output.outputVariables.FT_STATUS> != "PASSED"
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: ShellScript
+                  name: Block Promotion
+                  identifier: Block_Promotion
+                  timeout: 5m
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          echo "Functional tests FAILED for image <+pipeline.variables.imageRepo>:<+pipeline.variables.imageTag>"
+                          echo "The image was NOT promoted and will NOT be deployed to Prod."
+                          echo "See the Tests tab: <+pipeline.executionUrl>"
+                          exit 1
+                    environmentVariables: []
+                    outputVariables: []
+
+    # ------------------------------------------------------------------ PASS path
+    - stage:
+        name: Prod Approval
+        identifier: Prod_Approval
+        type: Approval
+        when:
+          pipelineStatus: Success
+          condition: <+pipeline.stages.Functional_Tests.spec.execution.steps.Run_Functional_Tests.output.outputVariables.FT_STATUS> == "PASSED"
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: HarnessApproval
+                  name: Approve Prod Release
+                  identifier: Approve_Prod_Release
+                  timeout: 1d
+                  spec:
+                    approvalMessage: |
+                      Build <+pipeline.variables.imageTag> passed the quality gate
+                      (<+pipeline.stages.Build_and_Quality_Gate.spec.execution.steps.Sonar_Quality_Gate.output.outputVariables.QUALITY_GATE_STATUS>)
+                      and functional tests on QA. Approve deployment to Prod?
+                    includePipelineExecutionHistory: true
+                    isAutoRejectEnabled: false
+                    approvers:
+                      userGroups:
+                        - _project_all_users
+                      minimumCount: 1
+                      disallowPipelineExecutor: false
+                    approverInputs: []
+
+    - stage:
+        name: Deploy Prod
+        identifier: Deploy_Prod
+        type: Deployment
+        when:
+          pipelineStatus: Success
+          condition: <+pipeline.stages.Functional_Tests.spec.execution.steps.Run_Functional_Tests.output.outputVariables.FT_STATUS> == "PASSED"
+        spec:
+          deploymentType: Kubernetes
+          service:
+            useFromStage:
+              stage: Deploy_QA
+          environment:
+            environmentRef: prod
+            deployToAll: false
+            infrastructureDefinitions:
+              - identifier: prod_k8s
+          execution:
+            steps:
+              - step:
+                  type: K8sRollingDeploy
+                  name: Rolling Deploy Prod
+                  identifier: Rolling_Deploy_Prod
+                  timeout: 10m
+                  spec:
+                    skipDryRun: false
+                    pruningEnabled: false
+            rollbackSteps:
+              - step:
+                  type: K8sRollingRollback
+                  name: Rollback Prod
+                  identifier: Rollback_Prod
+                  timeout: 10m
+                  spec:
+                    pruningEnabled: false
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: StageRollback
